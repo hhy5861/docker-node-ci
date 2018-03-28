@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+
+SRC_DIR=$1
+echo $SRC_DIR 1>&2
+echo $BUILD_ID 1>&2
+echo $BUILD_NAME 1>&2
+echo $BUILD_JOB_NAME 1>&2
+echo $BUILD_PIPELINE_NAME 1>&2
+echo $ATC_EXTERNAL_URL 1>&2
+
+PLATFORM=`uname`
+MD5_TOOL="md5sum"
+if [ $PLATFORM = "Darwin" ]; then
+  MD5_TOOL="md5"
+fi
+
+echo $MD5_TOOL 1>&2
+
+SCRIPT_INPUT='/tmp/input'
+cat > $SCRIPT_INPUT <&0 # STDIN params
+
+SERVERS=$(jq -r '.source.servers + [.source.server]|join(" ")'< $SCRIPT_INPUT)
+PORT=$(jq -r '.source.port // ""' < $SCRIPT_INPUT)
+BASE_DIR=$(jq -r '.source.base_dir // ""' < $SCRIPT_INPUT)
+USER=$(jq -r '.source.user // ""' < $SCRIPT_INPUT)
+SYNC_DIR=$(jq -r '.params.sync_dir // ""' < $SCRIPT_INPUT)
+RSYNC_OPTS_ARR=$(jq -r '.params.rsync_opts // ""' < $SCRIPT_INPUT)
+jq -re '.source.disable_version_path' < $SCRIPT_INPUT >/dev/null
+DISABLE_VERSION_PATH=$?
+
+if [ -z "$RSYNC_OPTS_ARR" ]
+then
+    RSYNC_OPTS="-Pav"
+else
+    RSYNC_OPTS=$(jq -r 'join(" ")' <<< $RSYNC_OPTS_ARR)
+fi
+
+## check if port is set in the configuration and
+## use default SSH port number 22 otherwise
+if [ -z "$PORT" ]; then
+    PORT=22
+fi
+
+echo $SCRIPT_INPUT 1>&2
+echo $SERVERS      1>&2
+echo $PORT         1>&2
+echo $BASE_DIR     1>&2
+echo $USER         1>&2
+echo $SYNC_DIR     1>&2
+echo "DISABLE_VERSION_PATH=$DISABLE_VERSION_PATH" 1>&2
+
+mkdir -p ~/.ssh
+(jq -r '.source.private_key // empty' < $SCRIPT_INPUT) > ~/.ssh/server_key
+for SERVER in $SERVERS
+do
+    echo -e "Host $SERVER\n\tStrictHostKeyChecking no\n" >> ~/.ssh/config
+done
+
+chmod -R 600 ~/.ssh
+
+eval $(ssh-agent) 1>&2 2>/dev/null
+SSH_ASKPASS=/opt/resource/askpass.sh DISPLAY= ssh-add ~/.ssh/server_key 1>&2 2>/dev/null
+
+VERSION_STRING="$BUILD_PIPELINE_NAME-$BUILD_ID"
+echo $VERSION_STRING 1>&2
+
+MD5_STRING=`echo $VERSION_STRING | $MD5_TOOL | cut -d ' ' -f 1 `
+if [ $? -eq 0 ]; then
+  echo $MD5_STRING 1>&2
+  
+  if [ $DISABLE_VERSION_PATH -eq 0 ]
+  then
+      MD5_PATH=""
+  else
+      MD5_PATH=$MD5_STRING
+  fi
+
+  # Create the new directory for this build
+  DEST_DIR=$BASE_DIR/$MD5_PATH
+  echo $DEST_DIR 1>&2
+  
+  REPORTED_VERSION=0
+  for SERVER in $SERVERS
+  do
+      CMD="ssh -i ~/.ssh/server_key -p $PORT $USER@$SERVER mkdir -p $DEST_DIR"
+      echo $CMD 1>&2
+      eval $CMD 1>&2
+      
+      if [ $? -eq 0 ]; then
+        RSYNC_CMD="rsync $RSYNC_OPTS -e 'ssh -i ~/.ssh/server_key -p $PORT'  $SRC_DIR/$SYNC_DIR/ $USER@$SERVER:$DEST_DIR"
+        echo $RSYNC_CMD 1>&2
+
+        eval $RSYNC_CMD  1>&2
+        if [ $? -eq 0 ]; then
+            if [ $REPORTED_VERSION -eq 0 ]
+            then
+                OUTPUT_STRING="{ \"version\": { \"ref\": \"$MD5_STRING\"} }"
+                echo $OUTPUT_STRING
+                REPORTED_VERSION=1
+            fi
+        else
+          echo "Failed to rsync $SRC_DIR to $DEST_DIR" 1>&2
+          exit 1
+        fi
+      else
+        echo "Failed to create destination $DEST_DIR" 1>&2
+        exit 1
+      fi
+  done
+else
+  echo "Failed to create MD5 hash" 1>&2
+  exit 1
+fi
